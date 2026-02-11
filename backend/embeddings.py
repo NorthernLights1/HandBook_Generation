@@ -1,42 +1,20 @@
-from __future__ import annotations
-
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# -----------------------------
-# Model cache (loaded once)
-# -----------------------------
-# Loading embedding models is slow. This avoids reloading on every rerun.
-_MODEL: SentenceTransformer | None = None
+_model = None
 
-
-def get_model(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> SentenceTransformer:
-    """
-    Return a cached embedding model.
-
-    Problem solved:
-    - Streamlit reruns would otherwise reload the model repeatedly (slow).
-    """
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer(model_name)
-    return _MODEL
-
+def _get_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return _model
 
 def embed_texts(texts: list[str]) -> np.ndarray:
-    """
-    Embed a list of texts into vectors suitable for FAISS.
+    model = _get_model()
+    vecs = model.encode(texts, convert_to_numpy=True).astype("float32")
 
-    Why normalize_embeddings=True:
-    - Normalized vectors allow cosine similarity via inner product (fast & standard).
-
-    Returns:
-    - float32 numpy array shaped (N, D)
-    """
-    model = get_model()
-    vectors = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
-    return vectors.astype("float32")
+    # ✅ L2 normalize (critical for cosine similarity)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    vecs = vecs / norms
+    return vecs

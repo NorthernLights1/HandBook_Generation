@@ -5,6 +5,7 @@ from backend.chunking import chunk_pages
 from backend.vector_store_faiss import FaissVectorStore
 from backend.rag_service import rag_answer
 from backend.handbook_service import generate_handbook
+from backend.vector_store import get_vector_store
 
 
 # -----------------------------
@@ -125,7 +126,7 @@ else:
 st.subheader("Index & Search (FAISS test)")
 
 # Create/load local store (persists index + metadata on disk)
-store = FaissVectorStore(store_dir=str(DATA_DIR))
+store = get_vector_store(store_dir=str(DATA_DIR))
 
 if st.session_state.uploaded_pdf_paths:
     pdf_for_index = st.selectbox(
@@ -222,7 +223,7 @@ if user_input:
             answer, retrieved, context_text = rag_answer(
                 question=user_input,
                 store=store,
-                k=6
+                k=10
             )
         except Exception as e:
             answer, retrieved, context_text = f"Error during RAG: {e}", [], ""
