@@ -1,5 +1,46 @@
 # Python
 __pycache__/
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+*.swp
+
+# Streamlit
+.streamlit/
+
+# Local storage
+storage/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Build artifacts
+dist/
+build/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
 *.pyc
 .venv/
 
