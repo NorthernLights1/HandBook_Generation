@@ -1,121 +1,129 @@
-# backend/vector_store_supabase.py
+from __future__ import annotations
+
 import os
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List
 
 from supabase import create_client, Client
+
+from backend.embeddings import embed_texts
 
 
 class SupabaseVectorStore:
     """
-    Supabase pgvector store (minimal, app-compatible).
+    Supabase pgvector-backed store.
 
-    Assumes:
-      - tables: documents, chunks
-      - RPC: match_chunks(query_embedding vector, match_count int)
-    Env:
-      - SUPABASE_URL
-      - SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_ANON_KEY
+    Contract matches FaissVectorStore:
+      - add_chunks(list[dict]) -> None
+      - search(query: str, k: int) -> list[dict]  (with score)
+
+    Requires env vars:
+      SUPABASE_URL
+      SUPABASE_SERVICE_ROLE_KEY   (recommended for demo server-side inserts)
     """
 
     def __init__(self):
         url = os.getenv("SUPABASE_URL")
         key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
         if not url or not key:
-            raise RuntimeError(
-                "Missing SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY)."
-            )
+            raise RuntimeError("Missing SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY)")
+
         self.client: Client = create_client(url, key)
 
-    # ---- Documents ---------------------------------------------------------
-
-    def insert_document(self, source: str, title: Optional[str] = None) -> str:
-        payload = {"source": source, "title": title}
-        res = self.client.table("documents").insert(payload).execute()
-        if not res.data:
-            raise RuntimeError("Failed to insert document into Supabase.")
-        return res.data[0]["id"]
-
-    # ---- Chunks ------------------------------------------------------------
-
-    def insert_chunks(self, document_id: str, chunks: List[Dict[str, Any]]) -> None:
+    def _get_or_create_document(self, source_path: str) -> str:
         """
-        Insert chunks for a single document_id.
-
-        chunks: list of dicts like:
-          {
-            "chunk_index": int,
-            "page_start": int,
-            "page_end": int,
-            "content": str,
-            "metadata": dict,
-            "embedding": list[float]
-          }
+        Ensure there's a row in documents for a given PDF.
+        Returns document_id (uuid as string).
         """
-        rows = []
-        for c in chunks:
-            rows.append(
-                {
-                    "document_id": document_id,
-                    "chunk_index": c.get("chunk_index"),
-                    "page_start": c.get("page_start"),
-                    "page_end": c.get("page_end"),
-                    "content": c["content"],
-                    "metadata": c.get("metadata", {}),
-                    "embedding": c.get("embedding"),
-                }
-            )
+        # Normalize: store only filename to avoid local absolute paths in DB
+        normalized = Path(source_path).name
 
-        if rows:
-            self.client.table("chunks").insert(rows).execute()
+        # Try fetch
+        res = self.client.table("documents").select("id").eq("source_path", normalized).execute()
+        if res.data:
+            return res.data[0]["id"]
+
+        # Insert
+        ins = self.client.table("documents").insert({
+            "source_path": normalized,
+            "title": normalized
+        }).execute()
+
+        return ins.data[0]["id"]
 
     def add_chunks(self, chunk_dicts: List[Dict[str, Any]]) -> None:
         """
-        Compatibility method expected by app.py: store.add_chunks(chunk_dicts)
+        Insert chunks + embeddings into Supabase.
 
-        Expects each chunk dict to contain:
-          - document_id (uuid string)
-          - content (str)
-          - embedding (list[float])
-
-        Optional:
-          - chunk_index, page_start, page_end, metadata
+        chunk_dict expected keys:
+          - text
+          - page
+          - chunk_index
+          - source_path
         """
         if not chunk_dicts:
             return
 
+        # 1) Embed all chunk texts
+        texts = [c["text"] for c in chunk_dicts]
+        vectors = embed_texts(texts)  # numpy float32, shape (N, D)
+
+        # 2) Batch insert chunks. Group by document for cleaner metadata.
         rows = []
-        for c in chunk_dicts:
-            doc_id = c.get("document_id")
-            if not doc_id:
-                raise RuntimeError("add_chunks: each chunk must include 'document_id'")
+        for i, c in enumerate(chunk_dicts):
+            doc_id = self._get_or_create_document(c["source_path"])
 
-            if "content" not in c:
-                raise RuntimeError("add_chunks: each chunk must include 'content'")
+            rows.append({
+                "document_id": doc_id,
+                "content": c["text"],
+                "metadata": {
+                    "page": int(c["page"]),
+                    "chunk_index": int(c["chunk_index"]),
+                    "source_path": Path(c["source_path"]).name
+                },
+                # supabase client will serialize list fine
+                "embedding": vectors[i].tolist()
+            })
 
-            rows.append(
-                {
-                    "document_id": doc_id,
-                    "chunk_index": c.get("chunk_index"),
-                    "page_start": c.get("page_start"),
-                    "page_end": c.get("page_end"),
-                    "content": c["content"],
-                    "metadata": c.get("metadata", {}),
-                    "embedding": c.get("embedding"),
-                }
-            )
+        # Insert in chunks to avoid payload limits
+        BATCH = 200
+        for start in range(0, len(rows), BATCH):
+            batch = rows[start:start + BATCH]
+            self.client.table("chunks").insert(batch).execute()
 
-        # Bulk insert
-        self.client.table("chunks").insert(rows).execute()
+    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Similarity search via RPC match_chunks.
+        Returns list in the same shape as FAISS store.search() results.
+        """
+        q_vec = embed_texts([query])[0].tolist()
 
-    # ---- Retrieval ---------------------------------------------------------
+        rpc = self.client.rpc("match_chunks", {
+            "query_embedding": q_vec,
+            "match_count": int(k),
+            "filter": {}
+        }).execute()
 
-    def similarity_search(self, query_embedding: List[float], k: int = 10) -> List[Dict[str, Any]]:
-        res = self.client.rpc(
-            "match_chunks",
-            {"query_embedding": query_embedding, "match_count": k},
-        ).execute()
-        return res.data or []
+        results = []
+        for row in (rpc.data or []):
+            md = row.get("metadata") or {}
+            results.append({
+                "text": row.get("content", ""),
+                "page": md.get("page", None),
+                "chunk_index": md.get("chunk_index", None),
+                "source_path": md.get("source_path", "unknown"),
+                "score": float(row.get("score", 0.0))
+            })
 
-    # Some codebases use retrieve() naming; keep a safe alias if needed.
-    def retrieve(self, query_embedding: List[float], k: int = 10) -> List[Dict[str, Any]]:
-        return self.similarity_search(query_embedding=query_embedding, k=k)
+        return results
+
+    def reset(self) -> None:
+        """
+        Optional: Clears all rows (for dev only).
+        WARNING: destructive.
+        """
+        # Supabase doesn't support delete all easily without conditions.
+        # For dev, you can run SQL:
+        #   truncate table public.chunks, public.documents restart identity;
+        raise NotImplementedError("Reset in Supabase should be done via SQL TRUNCATE in dev.")

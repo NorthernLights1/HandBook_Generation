@@ -1,18 +1,35 @@
 import streamlit as st
 from pathlib import Path
+from datetime import datetime
+
 from backend.ingest import extract_text_by_page
 from backend.chunking import chunk_pages
 from backend.vector_store_faiss import FaissVectorStore
 from backend.rag_service import rag_answer
 from backend.handbook_service import generate_handbook
-from backend.vector_store import get_vector_store
-
 
 # -----------------------------
-# Streamlit UI setup
+# Page config + style
 # -----------------------------
-st.set_page_config(page_title="Handbook Generator", layout="wide")
-st.title("AI Handbook Generator")
+st.set_page_config(page_title="Handbook Generator", page_icon="📘", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .small {opacity: 0.8; font-size: 0.9rem;}
+      .muted {opacity: 0.7;}
+      .pill {display:inline-block; padding:0.15rem 0.55rem; border-radius:999px;
+             border:1px solid rgba(255,255,255,0.15); font-size:0.85rem;}
+      .ok {background: rgba(0, 200, 0, 0.12);}
+      .warn {background: rgba(255, 200, 0, 0.12);}
+      .bad {background: rgba(255, 0, 0, 0.12);}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("📘 AI Handbook Generator")
+st.caption("Upload PDFs → Index → Chat with citations → Generate a long handbook")
 
 # -----------------------------
 # Persistent storage directories
@@ -20,219 +37,244 @@ st.title("AI Handbook Generator")
 BASE_DIR = Path(__file__).parent
 PDF_STORAGE_DIR = BASE_DIR / "storage" / "pdfs"
 DATA_DIR = BASE_DIR / "storage" / "data"
+HANDBOOK_DIR = BASE_DIR / "storage" / "handbooks"
 
 PDF_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+HANDBOOK_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# Session state initialization
+# Session state
 # -----------------------------
-# Tracks PDFs available for preview/indexing in this session
 if "uploaded_pdf_paths" not in st.session_state:
     st.session_state.uploaded_pdf_paths = []
-
-# Prevent double indexing the same PDF within one session
 if "indexed_pdf_paths" not in st.session_state:
     st.session_state.indexed_pdf_paths = []
-
-# Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "last_handbook_path" not in st.session_state:
+    st.session_state.last_handbook_path = ""
 
-# -----------------------------
-# Rehydrate PDFs list after restart
-# -----------------------------
-# session_state dies on restart, but disk persists
+# Rehydrate PDF list from disk on restart
 if not st.session_state.uploaded_pdf_paths:
-    existing_pdfs = sorted(PDF_STORAGE_DIR.glob("*.pdf"))
-    st.session_state.uploaded_pdf_paths = [str(p) for p in existing_pdfs]
+    st.session_state.uploaded_pdf_paths = [str(p) for p in sorted(PDF_STORAGE_DIR.glob("*.pdf"))]
+
+# Vector store (local)
+store = FaissVectorStore(store_dir=str(DATA_DIR))
 
 # -----------------------------
-# Upload UI
+# Sidebar: Upload + Index
 # -----------------------------
-uploaded_files = st.file_uploader(
-    "Upload PDF documents",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+with st.sidebar:
+    st.header("Setup")
 
-if uploaded_files:
-    new_count = 0
-    for uploaded_file in uploaded_files:
-        save_path = PDF_STORAGE_DIR / uploaded_file.name
-
-        # Persist bytes to disk
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        path_str = str(save_path)
-        if path_str not in st.session_state.uploaded_pdf_paths:
-            st.session_state.uploaded_pdf_paths.append(path_str)
-            new_count += 1
-
-    st.success(f"Saved {new_count} new PDF(s) to disk.")
-
-# -----------------------------
-# Show persisted PDFs
-# -----------------------------
-st.subheader("Persisted PDFs (source of knowledge)")
-if st.session_state.uploaded_pdf_paths:
-    for p in st.session_state.uploaded_pdf_paths:
-        st.write("•", p)
-else:
-    st.info("No PDFs uploaded yet.")
-
-# -----------------------------
-# Extraction / chunking preview
-# -----------------------------
-st.subheader("Extraction / Chunking test")
-
-if st.session_state.uploaded_pdf_paths:
-    pdf_for_preview = st.selectbox(
-        "Choose a PDF for extraction/chunk preview",
-        st.session_state.uploaded_pdf_paths,
-        key="pdf_preview"
+    uploaded_files = st.file_uploader(
+        "Upload PDF documents",
+        type=["pdf"],
+        accept_multiple_files=True
     )
 
-    colA, colB = st.columns(2)
+    if uploaded_files:
+        new_count = 0
+        for f in uploaded_files:
+            save_path = PDF_STORAGE_DIR / f.name
+            with open(save_path, "wb") as out:
+                out.write(f.getbuffer())
 
-    with colA:
-        if st.button("Extract text (page-by-page)"):
-            pages = extract_text_by_page(pdf_for_preview)
-            st.write(f"Extracted {len(pages)} pages.")
+            p = str(save_path)
+            if p not in st.session_state.uploaded_pdf_paths:
+                st.session_state.uploaded_pdf_paths.append(p)
+                new_count += 1
 
-            st.write("Preview (first 2 pages):")
-            for item in pages[:2]:
-                st.markdown(f"**Page {item['page']}**")
-                st.text(item["text"][:1500] if item["text"] else "[No text extracted]")
+        st.success(f"Saved {new_count} new PDF(s).")
 
-    with colB:
-        if st.button("Extract + Chunk"):
-            pages = extract_text_by_page(pdf_for_preview)
-            chunks = chunk_pages(pages, source_path=pdf_for_preview)
+    st.divider()
 
-            st.write(f"Chunks created: {len(chunks)}")
-            st.write("Preview (first 2 chunks):")
+    # PDF selection for indexing
+    if st.session_state.uploaded_pdf_paths:
+        pdf_for_index = st.selectbox(
+            "Select PDF to index",
+            st.session_state.uploaded_pdf_paths,
+            format_func=lambda x: Path(x).name,
+            key="pdf_index_sidebar",
+        )
 
-            for c in chunks[:2]:
-                st.markdown(f"**Page {c.page} | Chunk {c.chunk_index}**")
-                st.text(c.text[:1500] if c.text else "[Empty chunk]")
-else:
-    st.info("Upload a PDF to test extraction/chunking.")
+        indexed = pdf_for_index in st.session_state.indexed_pdf_paths
+        badge = "Indexed ✅" if indexed else "Not indexed ⚠️"
+        css = "pill ok" if indexed else "pill warn"
+        st.markdown(f"<span class='{css}'>{badge}</span>", unsafe_allow_html=True)
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            if st.button("Index", use_container_width=True):
+                if indexed:
+                    st.warning("Already indexed in this session. Reset to re-index.")
+                else:
+                    pages = extract_text_by_page(pdf_for_index)
+                    chunks = chunk_pages(pages, source_path=pdf_for_index)
+
+                    chunk_dicts = [{
+                        "text": c.text,
+                        "page": c.page,
+                        "chunk_index": c.chunk_index,
+                        "source_path": c.source_path
+                    } for c in chunks]
+
+                    store.add_chunks(chunk_dicts)
+                    st.session_state.indexed_pdf_paths.append(pdf_for_index)
+                    st.success(f"Indexed {len(chunk_dicts)} chunks.")
+
+        with col_b:
+            if st.button("Reset index", use_container_width=True):
+                store.reset()
+                st.session_state.indexed_pdf_paths = []
+                st.warning("Index cleared.")
+
+        st.caption("Tip: Index at least 1 PDF before chatting or generating a handbook.")
+    else:
+        st.info("Upload PDFs to enable indexing.")
+
+    st.divider()
+    st.subheader("Files")
+
+    if st.session_state.uploaded_pdf_paths:
+        for p in st.session_state.uploaded_pdf_paths[:8]:
+            st.write("•", Path(p).name)
+        if len(st.session_state.uploaded_pdf_paths) > 8:
+            st.write(f"… +{len(st.session_state.uploaded_pdf_paths) - 8} more")
+    else:
+        st.caption("No PDFs yet.")
 
 # -----------------------------
-# FAISS Indexing + Search test
+# Main area: Tabs
 # -----------------------------
-st.subheader("Index & Search (FAISS test)")
+tab_chat, tab_handbook, tab_debug = st.tabs(["💬 Chat", "📄 Handbook", "🧪 Debug"])
 
-# Create/load local store (persists index + metadata on disk)
-store = get_vector_store(store_dir=str(DATA_DIR))
+# -----------------------------
+# Chat tab (thin UI)
+# -----------------------------
+with tab_chat:
+    if not st.session_state.indexed_pdf_paths:
+        st.warning("Index at least one PDF first (use the sidebar).")
 
-if st.session_state.uploaded_pdf_paths:
-    pdf_for_index = st.selectbox(
-        "Choose a PDF to index",
-        st.session_state.uploaded_pdf_paths,
-        key="pdf_index"
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    user_input = st.chat_input("Ask a question grounded in your PDFs (citations required)")
+
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.write(user_input)
+
+        with st.chat_message("assistant"):
+            try:
+                answer, retrieved, context_text = rag_answer(
+                    question=user_input,
+                    store=store,
+                    k=6
+                )
+            except Exception as e:
+                answer, retrieved, context_text = f"Error during RAG: {e}", [], ""
+
+            st.write(answer)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        # Keep debug hidden by default
+        with st.expander("Show retrieved evidence (debug)"):
+            st.text(context_text if context_text else "[No retrieved context]")
+
+# -----------------------------
+# Handbook tab
+# -----------------------------
+with tab_handbook:
+    st.subheader("Generate a long handbook")
+
+    topic = st.text_input(
+        "Topic",
+        value="Retrieval-Augmented Generation",
+        help="Keep it specific to get better structure."
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1, 1])
 
     with col1:
-        if st.button("Index selected PDF"):
-            # Guard against duplicate indexing in the same session
-            if pdf_for_index in st.session_state.indexed_pdf_paths:
-                st.warning("Already indexed this PDF in this session. Reset index to re-index.")
-            else:
-                pages = extract_text_by_page(pdf_for_index)
-                chunks = chunk_pages(pages, source_path=pdf_for_index)
-
-                chunk_dicts = [{
-                    "text": c.text,
-                    "page": c.page,
-                    "chunk_index": c.chunk_index,
-                    "source_path": c.source_path
-                } for c in chunks]
-
-                store.add_chunks(chunk_dicts)
-                st.session_state.indexed_pdf_paths.append(pdf_for_index)
-
-                st.success(f"Indexed {len(chunk_dicts)} chunks from {Path(pdf_for_index).name}")
+        generate = st.button("Generate handbook", type="primary", use_container_width=True)
 
     with col2:
-        if st.button("Reset index"):
-            store.reset()
-            st.session_state.indexed_pdf_paths = []
-            st.warning("Index cleared (FAISS + metadata reset).")
-
-    query = st.text_input("Search query (retrieval test)")
-    if query:
-        results = store.search(query, k=5)
-
-        if not results:
-            st.info("No results. Index a PDF first.")
+        if st.session_state.last_handbook_path:
+            st.markdown(f"<span class='pill ok'>Last output saved ✅</span>", unsafe_allow_html=True)
         else:
-            for r in results:
-                st.markdown(
-                    f"**Score:** {r['score']:.3f} | "
-                    f"**Page:** {r['page']} | "
-                    f"**Chunk:** {r['chunk_index']} | "
-                    f"**Source:** {Path(r['source_path']).name}"
-                )
-                st.text(r["text"][:1200])
-                st.divider()
-else:
-    st.info("Upload PDFs first to index and search.")
+            st.markdown(f"<span class='pill warn'>No output yet</span>", unsafe_allow_html=True)
 
-# HandBook Trigger
+    if generate:
+        if not st.session_state.indexed_pdf_paths:
+            st.error("Index at least one PDF first (sidebar).")
+        else:
+            with st.spinner("Generating section-by-section… (this can take a while)"):
+                try:
+                    handbook_text, saved_path = generate_handbook(topic, store)
+                    st.session_state.last_handbook_path = saved_path
+                    st.success(f"Saved: {saved_path}")
+                    st.text_area("Preview", handbook_text[:12000], height=400)
+                    st.caption("Preview shows the first part only. Open the saved .md file for full output.")
+                except Exception as e:
+                    st.error(f"Handbook generation failed: {e}")
 
-st.subheader("Handbook Generation (20k+)")
-
-topic = st.text_input("Handbook topic (example: Retrieval-Augmented Generation)")
-
-if st.button("Generate handbook"):
-    with st.spinner("Generating handbook (section-by-section)..."):
-        try:
-            handbook_text, saved_path = generate_handbook(topic, store)
-            st.success(f"Saved to: {saved_path}")
-            st.text_area("Handbook output (preview)", handbook_text, height=400)
-        except Exception as e:
-            st.error(f"Handbook generation failed: {e}")
-
+    # Show latest handbook file (if exists)
+    latest_files = sorted(HANDBOOK_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if latest_files:
+        latest = latest_files[0]
+        st.caption(f"Latest handbook: {latest.name} • modified {datetime.fromtimestamp(latest.stat().st_mtime)}")
+    else:
+        st.caption("No handbook files found yet.")
 
 # -----------------------------
-# Chat (RAG) — thin UI handler
+# Debug tab (only for you)
 # -----------------------------
-st.subheader("Chat (RAG)")
+with tab_debug:
+    st.subheader("Diagnostics")
 
-# Render chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+    st.write("Indexed PDFs this session:", len(st.session_state.indexed_pdf_paths))
+    st.write("PDFs available:", len(st.session_state.uploaded_pdf_paths))
 
-user_input = st.chat_input("Ask a question grounded in your PDFs")
+    st.divider()
+    st.write("Storage paths:")
+    st.code(
+        f"PDFs: {PDF_STORAGE_DIR}\n"
+        f"Index: {DATA_DIR}\n"
+        f"Handbooks: {HANDBOOK_DIR}",
+        language="text"
+    )
 
-if user_input:
-    # Store + show user message
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.write(user_input)
+    st.divider()
+    if st.session_state.uploaded_pdf_paths:
+        pdf_for_preview = st.selectbox(
+            "Preview extraction/chunking for a PDF",
+            st.session_state.uploaded_pdf_paths,
+            format_func=lambda x: Path(x).name,
+            key="pdf_preview_debug",
+        )
 
-    # Call reusable RAG service
-    with st.chat_message("assistant"):
-        try:
-            answer, retrieved, context_text = rag_answer(
-                question=user_input,
-                store=store,
-                k=10
-            )
-        except Exception as e:
-            answer, retrieved, context_text = f"Error during RAG: {e}", [], ""
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Extract preview"):
+                pages = extract_text_by_page(pdf_for_preview)
+                st.write(f"Extracted pages: {len(pages)}")
+                for item in pages[:2]:
+                    st.markdown(f"**Page {item['page']}**")
+                    st.text(item["text"][:1500] if item["text"] else "[No text extracted]")
 
-        st.write(answer)
-
-    # Store assistant reply
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-
-    # Debug: show exactly what evidence was used
-    with st.expander("Retrieved context (debug)"):
-        st.text(context_text if context_text else "[No retrieved context]")
+        with colB:
+            if st.button("Chunk preview"):
+                pages = extract_text_by_page(pdf_for_preview)
+                chunks = chunk_pages(pages, source_path=pdf_for_preview)
+                st.write(f"Chunks: {len(chunks)}")
+                for c in chunks[:2]:
+                    st.markdown(f"**Page {c.page} | Chunk {c.chunk_index}**")
+                    st.text(c.text[:1500] if c.text else "[Empty chunk]")
+    else:
+        st.info("Upload PDFs to enable debug previews.")
